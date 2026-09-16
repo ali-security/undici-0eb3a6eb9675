@@ -4,6 +4,7 @@ const { tspl } = require('@matteo.collina/tspl')
 const { test, after } = require('node:test')
 const { Client, errors } = require('..')
 const { createServer } = require('node:http')
+const { createServer: createNetServer } = require('node:net')
 
 test('handle headers as array', async (t) => {
   t = tspl(t, { plan: 3 })
@@ -148,6 +149,235 @@ test('fail if headers is not an object or an array', async (t) => {
     }, (err) => {
       t.ok(err instanceof errors.InvalidArgumentError)
       t.strictEqual(err.message, 'headers must be an object or an array')
+    })
+  })
+
+  await t.completed
+})
+
+test('fail if duplicate content-length headers (different case)', async (t) => {
+  t = tspl(t, { plan: 2 })
+  const headers = ['Content-Length', '5', 'content-length', '0']
+
+  const server = createServer({ joinDuplicateHeaders: true }, (req, res) => { res.end() })
+  after(() => server.close())
+  server.listen(0, () => {
+    const client = new Client(`http://localhost:${server.address().port}`)
+    after(() => client.close())
+
+    client.request({
+      path: '/',
+      method: 'POST',
+      headers,
+      body: 'hello'
+    }, (err) => {
+      t.ok(err instanceof errors.InvalidArgumentError)
+      t.strictEqual(err.message, 'duplicate content-length header')
+    })
+  })
+
+  await t.completed
+})
+
+test('fail if duplicate content-length headers (same case)', async (t) => {
+  t = tspl(t, { plan: 2 })
+  const headers = ['content-length', '5', 'content-length', '0']
+
+  const server = createServer({ joinDuplicateHeaders: true }, (req, res) => { res.end() })
+  after(() => server.close())
+  server.listen(0, () => {
+    const client = new Client(`http://localhost:${server.address().port}`)
+    after(() => client.close())
+
+    client.request({
+      path: '/',
+      method: 'POST',
+      headers,
+      body: 'hello'
+    }, (err) => {
+      t.ok(err instanceof errors.InvalidArgumentError)
+      t.strictEqual(err.message, 'duplicate content-length header')
+    })
+  })
+
+  await t.completed
+})
+
+test('fail if duplicate host headers (different case)', async (t) => {
+  t = tspl(t, { plan: 2 })
+  const headers = ['Host', 'example.com', 'host', 'evil.com']
+
+  const server = createServer({ joinDuplicateHeaders: true }, (req, res) => { res.end() })
+  after(() => server.close())
+  server.listen(0, () => {
+    const client = new Client(`http://localhost:${server.address().port}`)
+    after(() => client.close())
+
+    client.request({
+      path: '/',
+      method: 'GET',
+      headers
+    }, (err) => {
+      t.ok(err instanceof errors.InvalidArgumentError)
+      t.strictEqual(err.message, 'duplicate host header')
+    })
+  })
+
+  await t.completed
+})
+
+test('fail if duplicate host headers (same case)', async (t) => {
+  t = tspl(t, { plan: 2 })
+  const headers = ['host', 'example.com', 'host', 'evil.com']
+
+  const server = createServer({ joinDuplicateHeaders: true }, (req, res) => { res.end() })
+  after(() => server.close())
+  server.listen(0, () => {
+    const client = new Client(`http://localhost:${server.address().port}`)
+    after(() => client.close())
+
+    client.request({
+      path: '/',
+      method: 'GET',
+      headers
+    }, (err) => {
+      t.ok(err instanceof errors.InvalidArgumentError)
+      t.strictEqual(err.message, 'duplicate host header')
+    })
+  })
+
+  await t.completed
+})
+
+test('fail if duplicate content-length headers (object with case variants)', async (t) => {
+  t = tspl(t, { plan: 2 })
+  const headers = { 'Content-Length': '5', 'content-length': '0' }
+
+  const server = createServer({ joinDuplicateHeaders: true }, (req, res) => { res.end() })
+  after(() => server.close())
+  server.listen(0, () => {
+    const client = new Client(`http://localhost:${server.address().port}`)
+    after(() => client.close())
+
+    client.request({
+      path: '/',
+      method: 'POST',
+      headers,
+      body: 'hello'
+    }, (err) => {
+      t.ok(err instanceof errors.InvalidArgumentError)
+      t.strictEqual(err.message, 'duplicate content-length header')
+    })
+  })
+
+  await t.completed
+})
+
+test('fail if duplicate host headers (object with case variants)', async (t) => {
+  t = tspl(t, { plan: 2 })
+  const headers = { Host: 'example.com', host: 'evil.com' }
+
+  const server = createServer({ joinDuplicateHeaders: true }, (req, res) => { res.end() })
+  after(() => server.close())
+  server.listen(0, () => {
+    const client = new Client(`http://localhost:${server.address().port}`)
+    after(() => client.close())
+
+    client.request({
+      path: '/',
+      method: 'GET',
+      headers
+    }, (err) => {
+      t.ok(err instanceof errors.InvalidArgumentError)
+      t.strictEqual(err.message, 'duplicate host header')
+    })
+  })
+
+  await t.completed
+})
+
+test('fail if duplicate content-length headers (key-value pair iterable)', async (t) => {
+  t = tspl(t, { plan: 2 })
+  const headers = new Map([['Content-Length', '5'], ['content-length', '0']])
+
+  const server = createServer({ joinDuplicateHeaders: true }, (req, res) => { res.end() })
+  after(() => server.close())
+  server.listen(0, () => {
+    const client = new Client(`http://localhost:${server.address().port}`)
+    after(() => client.close())
+
+    client.request({
+      path: '/',
+      method: 'POST',
+      headers,
+      body: 'hello'
+    }, (err) => {
+      t.ok(err instanceof errors.InvalidArgumentError)
+      t.strictEqual(err.message, 'duplicate content-length header')
+    })
+  })
+
+  await t.completed
+})
+
+test('does not write conflicting content-length headers to the wire', async (t) => {
+  t = tspl(t, { plan: 3 })
+  const headers = ['Content-Length', '5', 'content-length', '0']
+
+  // Raw TCP server so the exact bytes undici would have written are observable.
+  // Without the fix the request head reaches the wire carrying both
+  // `content-length: 0` and `content-length: 5`, which is the smuggling primitive.
+  const chunks = []
+  const server = createNetServer((socket) => {
+    socket.on('data', (chunk) => {
+      chunks.push(chunk)
+      socket.write('HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n')
+    })
+    socket.on('error', () => {})
+  })
+  after(() => server.close())
+  server.listen(0, () => {
+    const client = new Client(`http://localhost:${server.address().port}`)
+    after(() => client.close())
+
+    client.request({
+      path: '/',
+      method: 'POST',
+      headers,
+      body: 'hello'
+    }, (err) => {
+      t.ok(err instanceof errors.InvalidArgumentError)
+      t.strictEqual(err.message, 'duplicate content-length header')
+      // The request is rejected before anything is written, so a pair of
+      // conflicting Content-Length values can never reach an intermediary.
+      t.strictEqual(Buffer.concat(chunks).toString('latin1'), '')
+    })
+  })
+
+  await t.completed
+})
+
+test('keeps forwarding a single content-length and host header', async (t) => {
+  t = tspl(t, { plan: 3 })
+  const headers = ['Content-Length', '5', 'Host', 'example.com']
+
+  const server = createServer({ joinDuplicateHeaders: true }, (req, res) => {
+    t.strictEqual(req.headers['content-length'], '5')
+    t.strictEqual(req.headers.host, 'example.com')
+    res.end()
+  })
+  after(() => server.close())
+  server.listen(0, () => {
+    const client = new Client(`http://localhost:${server.address().port}`)
+    after(() => client.close())
+
+    client.request({
+      path: '/',
+      method: 'POST',
+      headers,
+      body: 'hello'
+    }, (err) => {
+      t.ifError(err)
     })
   })
 
