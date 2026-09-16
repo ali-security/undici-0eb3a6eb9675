@@ -152,6 +152,29 @@ test('Cookie Path Validation', () => {
   )
 })
 
+test('Cookie Path Validation rejects non-ascii', () => {
+  const paths = [
+    '/a\xE9', // é, 0xE9
+    '/\x80', // first C1 control
+    '/\x9F', // last C1 control
+    '/\xFF'
+  ]
+  const headers = new Headers()
+  paths.forEach((path) => {
+    assert.throws(
+      () => {
+        setCookie(headers, {
+          name: 'Space',
+          value: 'Cat',
+          path
+        })
+      },
+      new Error('Invalid cookie path'),
+      path + ': Invalid cookie path char'
+    )
+  })
+})
+
 test('Cookie Domain Validation', () => {
   const tokens = ['-domain.com', 'domain.org.', 'domain.org-']
   const headers = new Headers()
@@ -171,6 +194,22 @@ test('Cookie Domain Validation', () => {
       'Invalid first/last char in cookie domain: ' + domain
     )
   })
+})
+
+test('Cookie Unparsed Validation', () => {
+  const parts = [
+    'X-Custom=val; HttpOnly',
+    'Purpose=tracking; SameSite=None; Secure',
+    'HttpOnly; X-Custom=val'
+  ]
+
+  for (const part of parts) {
+    assert.throws(() => setCookie(new Headers(), {
+      name: 'Space',
+      value: 'Cat',
+      unparsed: [part]
+    }))
+  }
 })
 
 test('Cookie Delete', () => {
