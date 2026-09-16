@@ -1,21 +1,27 @@
 name: Node CI
 
 on:
-  push:
-    branches:
-     - main
-     - current
-     - next
-     - 'v*'
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      # SEAL: scope a dispatch to a subset of the JavaScript suite while
+      # iterating on a single patch. Comma-separated list of borp glob
+      # patterns (e.g. "test/fetch/encoding.js,test/fetch/redirect.js").
+      # Leave empty to run the complete `npm run test:javascript` chain.
+      test-filter:
+        description: Comma-separated borp glob patterns to run instead of the full suite
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   dependency-review:
-    if: ${{ github.event_name == 'pull_request' }}
+    # SEAL: PR-event-only job; it cannot run on a workflow_dispatch build.
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@f086349bfa2bd1361f7909c78558e816508cdc10 # v2.8.0
@@ -32,7 +38,12 @@ jobs:
 
   lint:
     name: Lint
+    # SEAL: `standard` reports a padded-blocks violation on the pristine shipped
+    # lib/dispatcher/agent.js; fixing it would break byte parity with the
+    # published tarball. Lint is a style gate, not a test.
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
@@ -50,7 +61,12 @@ jobs:
       - name: Lint
         run: npm run lint
 
+  # SEAL: upstream declares this job as `uses: ./.github/workflows/test.yml`.
+  # A reusable-workflow call cannot declare `timeout-minutes`, which the build
+  # harness requires on every job, so the steps of test.yml are inlined here
+  # verbatim with `inputs.*` translated to `matrix.*`.
   test:
+    name: Test with Node.js ${{ matrix.node-version }} on ${{ matrix.runs-on }}
     strategy:
       fail-fast: false
       max-parallel: 0
@@ -64,14 +80,98 @@ jobs:
           - ubuntu-latest
           - windows-latest
           - macos-latest
-    uses: ./.github/workflows/test.yml
-    with:
-      node-version: ${{ matrix.node-version }}
-      runs-on: ${{ matrix.runs-on }}
-    secrets: inherit
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js@${{ matrix.node-version }}
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Print version information
+        run: |
+          echo OS: $(node -p "os.version()")
+          echo Node.js: $(node --version)
+          echo npm: $(npm --version)
+          echo git: $(git --version)
+
+      # SEAL: resolve dependencies as they were at the 6.21.2 release date.
+      - name: Configure registry time machine
+        shell: bash
+        run: |
+          npm config set registry https://time-machines-npm.sealsecurity.io/
+          npm config set //time-machines-npm.sealsecurity.io/:_authToken=2025-03-13
+
+      - name: Install dependencies
+        run: npm install
+
+      # SEAL: scoped run used while iterating on an individual CVE patch. Runs
+      # only the borp glob patterns listed in the `test-filter` input, one borp
+      # invocation per pattern (the dispatch input cannot carry a brace-glob).
+      # A pattern that resolves to no file is a hard error rather than borp's
+      # silent `tests 0` exit-0, and every pattern's exit status is accumulated
+      # so a single failure fails the leg. The full suite still runs whenever
+      # `test-filter` is empty, so a finalize build is unaffected.
+      - name: Run scoped tests
+        if: ${{ inputs.test-filter != '' }}
+        shell: bash
+        env:
+          CI: true
+          NODE_OPTIONS: --max-old-space-size=4096
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -u
+          node scripts/generate-pem
+          npm run build:node
+          status=0
+          IFS=',' read -ra raw_patterns <<< "$TEST_FILTER"
+          for raw in "${raw_patterns[@]}"; do
+            pattern="$(echo "$raw" | tr -d '[:space:]')"
+            if [ -z "$pattern" ]; then
+              continue
+            fi
+            files=( $pattern )
+            if [ ! -e "${files[0]}" ]; then
+              echo "SCOPED-TEST-ERROR: pattern '$pattern' matched no file"
+              status=1
+              continue
+            fi
+            echo "=== scoped borp run: $pattern (${#files[@]} file(s)) ==="
+            case "$pattern" in
+              test/fetch/*)
+                npx borp --timeout 180000 --expose-gc --concurrency 1 -p "$pattern" || status=1
+                ;;
+              *)
+                npx borp --expose-gc -p "$pattern" || status=1
+                ;;
+            esac
+          done
+          exit $status
+
+      - name: Run tests
+        if: ${{ inputs.test-filter == '' }}
+        run: npm run test:javascript
+        env:
+          CI: true
+          # SEAL: the WPT runner forks a worker per fixture file and has been seen to
+          # die at the process level on the Node 20 legs (macOS: "Segmentation fault:
+          # 11  node test/wpt/start-websockets.mjs"; Windows: abrupt exit 1 mid
+          # start-fetch.mjs) — on a different file each run, on legs that were green
+          # the run before. Give V8 explicit heap headroom instead of masking it.
+          # No test is skipped, excluded or altered by this.
+          NODE_OPTIONS: --max-old-space-size=4096
 
   test-without-intl:
     name: Test with Node.js ${{ matrix.version }} compiled --without-intl
+    # SEAL: this job compiles Node.js from source (upstream timeout-minutes: 120),
+    # far over the build harness per-job budget. It re-runs the same suites
+    # against an intl-less Node, so disabling it loses no test coverage.
+    if: false
     strategy:
       fail-fast: false
       max-parallel: 0
@@ -144,6 +244,7 @@ jobs:
   test-fuzzing:
     name: Fuzzing
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
@@ -154,6 +255,13 @@ jobs:
         uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
         with:
           node-version: lts/*
+
+      # SEAL: resolve dependencies as they were at the 6.21.2 release date.
+      - name: Configure registry time machine
+        shell: bash
+        run: |
+          npm config set registry https://time-machines-npm.sealsecurity.io/
+          npm config set //time-machines-npm.sealsecurity.io/:_authToken=2025-03-13
 
       - name: Install dependencies
         run: npm install
@@ -175,16 +283,62 @@ jobs:
         uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
         with:
           node-version: lts/*
-      
+
+      # SEAL: resolve dependencies as they were at the 6.21.2 release date.
+      - name: Configure registry time machine
+        shell: bash
+        run: |
+          npm config set registry https://time-machines-npm.sealsecurity.io/
+          npm config set //time-machines-npm.sealsecurity.io/:_authToken=2025-03-13
+
       - name: Install dependencies
         run: npm install
 
       - name: Run typings tests
         run: npm run test:typescript
 
+  # SEAL: upstream never packs the release tarball in CI; this job adds the
+  # missing build step and uploads the artifact.
+  pack:
+    name: Pack
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: 18
+
+      # SEAL: resolve dependencies as they were at the 6.21.2 release date.
+      - name: Configure registry time machine
+        shell: bash
+        run: |
+          npm config set registry https://time-machines-npm.sealsecurity.io/
+          npm config set //time-machines-npm.sealsecurity.io/:_authToken=2025-03-13
+
+      # SEAL: the install is mandatory — without it `npm pack --ignore-scripts`
+      # still fires the `prepare` lifecycle and dies with `husky: not found`.
+      - name: Pack tarball
+        run: |
+          npm install --ignore-scripts
+          npm pack --ignore-scripts
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: undici-tarball
+          path: undici-6.21.2.tgz
+          if-no-files-found: error
+
   automerge:
-    if: >
-      github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]'
+    # SEAL: PR-event-only job; it cannot run on a workflow_dispatch build.
+    if: false
+    timeout-minutes: 15
     needs:
       - dependency-review
       - test
